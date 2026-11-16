@@ -46,6 +46,11 @@ CLAMP = -9999.0
 MAX_MODEL_LEN = 32768
 # The request is untrusted and the stop strings are checked after every token: their number and length are bounded.
 MAX_STOPS, MAX_STOP_CHARS = 16, 1000
+# vLLM parameters that change the sampled tokens and that this backend does not implement, with their neutral values.
+# Any other value is refused: a request must not silently mean something else here than on vLLM. The neutral values
+# pass, since clients send them (the frontend's decision reads send repetition_penalty 1).
+UNSUPPORTED = {"frequency_penalty": 0, "presence_penalty": 0, "repetition_penalty": 1, "min_tokens": 0,
+               "ignore_eos": False, "logit_bias": {}, "bad_words": [], "stop_token_ids": [], "allowed_token_ids": None}
 BASE_HEAD_FLAG, BASE_HEAD_VALUE = "systemone_head", "base"
 # Base repository files the backend reads: mlx_lm loads model*.safetensors, the config (and hf_quant_config.json
 # when the config has no quantization) and the tokenizer; transformers also reads additional_chat_templates/*.jinja.
@@ -275,6 +280,10 @@ def sampling(body: dict, defaults: dict, prompt_tokens: int, vocab_size: int) ->
         raise ValueError(f"stop takes at most {MAX_STOPS} strings of at most {MAX_STOP_CHARS} characters")
     if (body.get("n") or 1) != 1:
         raise ValueError("n > 1 is not supported")
+    for name, neutral in UNSUPPORTED.items():
+        value = pick(name, neutral)
+        if value is not None and (value != neutral or isinstance(value, bool) != isinstance(neutral, bool)):
+            raise ValueError(f"{name} is not supported by the MLX backend (only {json.dumps(neutral)})")
     return {
         "temperature": temperature,
         "top_p": top_p if top_p < 1 else 0.0,  # 0: off, for mlx_lm

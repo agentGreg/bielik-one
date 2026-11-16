@@ -183,6 +183,23 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(r.json()["error"]["type"], "BadRequestError")
         self.assertEqual([k for k, _ in runner.calls if k == "generate"], [])
 
+    def test_unsupported_sampling_parameters_are_refused_unless_neutral(self):
+        """Penalties and the like are not implemented: refused before the stream starts, not silently ignored."""
+        c, runner = client()
+        for extra in ({"frequency_penalty": 3}, {"presence_penalty": -3}, {"repetition_penalty": 0},
+                      {"repetition_penalty": 1.1}, {"min_tokens": 5}, {"ignore_eos": True}, {"logit_bias": {"5": 1}},
+                      {"bad_words": ["x"]}, {"stop_token_ids": [2]}, {"allowed_token_ids": [5]}):
+            body = {"messages": [{"role": "user", "content": "hi"}], "stream": True, **extra}
+            r = c.post("/v1/chat/completions", json=body)
+            self.assertEqual(r.status_code, 400, extra)
+            self.assertIn("not supported", r.json()["error"]["message"])
+        self.assertEqual([k for k, _ in runner.calls if k == "generate"], [])
+        neutral = {"frequency_penalty": 0, "presence_penalty": 0.0, "repetition_penalty": 1, "min_tokens": 0,
+                   "ignore_eos": False, "logit_bias": {}, "bad_words": [], "stop_token_ids": [], "allowed_token_ids": None}
+        self.assertEqual(mlx_backend.sampling(neutral, {}, 10, 1000)["max_tokens"], mlx_backend.MAX_MODEL_LEN - 10)
+        with self.assertRaises(ValueError):  # a generation_config that sets a penalty is refused too
+            mlx_backend.sampling({}, {"repetition_penalty": 1.05}, 10, 1000)
+
     def test_official_frontend_reads_through_the_backend(self):
         """RemoteVllmEngine's read (anchor, canary, clamping checks) accepts the backend's answers."""
         c, _ = client(base_row_heads=True)

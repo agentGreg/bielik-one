@@ -135,9 +135,10 @@ class MlxRunner:
             raise ValueError("head token ids must be within the model's vocabulary")
         config = base / "generation_config.json"
         generation = json.loads(config.read_text()) if config.is_file() else {}
-        self.generation_defaults = {
-            k: generation[k] for k in ("temperature", "top_p", "top_k", "min_p") if generation.get(k) is not None
-        }
+        # the penalties only to refuse requests on a model whose generation_config sets them (not implemented here)
+        names = ("temperature", "top_p", "top_k", "min_p",
+                 "repetition_penalty", "frequency_penalty", "presence_penalty")
+        self.generation_defaults = {k: generation[k] for k in names if generation.get(k) is not None}
         self.lock = threading.Lock()  # also guards Switch
         gib = 2**30
         self.summary = (
