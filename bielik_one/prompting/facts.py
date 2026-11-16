@@ -538,6 +538,7 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
     suffixed = list(islice(AMOUNT_SUFFIX.finditer(text), MAX_MATCHES))
     # where the amounts of both forms end: a dash right after one is a range ("100 GBP - £200"), not a minus sign
     ends = {m.end() for m in prefixed + suffixed}
+    range_ends, range_starts = set(), set()  # the two ends of such ranges: compared, never summed
 
     def negative(start):
         """A minus sign before the amount, separated by spaces ("- £600", "- 600 zł"); the regexes reject "-£600".
@@ -552,7 +553,11 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
             k -= 1
         if text[i - 1] == "-" and (not k or text[k - 1] == "\n"):
             return False  # a list bullet
-        return k not in ends
+        if k in ends:
+            range_ends.add(k)
+            range_starts.add(start)
+            return False
+        return True
 
     for m in prefixed:
         if not free(m.start(), m.end()) or negative(m.start()):
@@ -581,6 +586,8 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
             v = _number(raw, lang, money=unit in MONEY)
             if v is not None:
                 out.append(_Amount(start, m.end(), v, unit, _places(raw, lang), False, sym, ranged))
+    for a in out:
+        a.bound = a.bound or a.end in range_ends or a.start in range_starts
     out.sort(key=lambda a: a.start)
     return out[:MAX_MATCHES]
 

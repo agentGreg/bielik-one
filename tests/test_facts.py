@@ -528,6 +528,9 @@ def test_a_minus_sign_separated_by_a_space_is_still_negative():
     # a range and a list bullet are not a minus sign
     assert lines_of("Price range £100 - £200.", "Is it above £150?") == ["£100 < £150", "£200 > £150"]
     assert lines_of("Price range 100 GBP - £200.", "Is it above £150?") == ["100 GBP < £150", "£200 > £150"]
+    # the ends of a range are compared, never added up; two separate amounts still are
+    assert not any(" + " in x for x in lines_of("Price range 100 GBP - £200.", "Is the total above £250?"))
+    assert "100 GBP + £200 = 300 GBP" in lines_of("Price 100 GBP and £200.", "Is the total above £250?")
     assert "£600 > £500" in lines_of("Balances:\n- £600\n- £50", "Is a balance above £500?")
 
 
