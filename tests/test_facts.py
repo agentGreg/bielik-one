@@ -508,6 +508,7 @@ def test_english_text_quoting_a_polish_amount():
         ("Delivered on 30 April 2026.", "Respond within 1 working day. 1 May 2026 is a day off."),
         ("Delivered on 30 April 2026. 1 May 2026 is a day off.", "Respond within 1 working day."),
         ("Zugestellt am 30. April 2026. Der 1. Mai 2026 ist ein freier Tag.", "Antwort binnen 1 Werktag."),
+        ("Delivered on 30 April 2026 at 12:00. 1 May 2026 is a day off.", "Respond within 1 working day."),
     ],
 )
 def test_english_and_german_days_off_and_a_sentence_starting_with_a_date(state, rule):
@@ -526,6 +527,7 @@ def test_a_minus_sign_separated_by_a_space_is_still_negative():
     assert lines_of("Saldo wynosi - 600 zł, opłata − 700 zł.", "Czy saldo przekracza 500 zł?") == []
     # a range and a list bullet are not a minus sign
     assert lines_of("Price range £100 - £200.", "Is it above £150?") == ["£100 < £150", "£200 > £150"]
+    assert lines_of("Price range 100 GBP - £200.", "Is it above £150?") == ["100 GBP < £150", "£200 > £150"]
     assert "£600 > £500" in lines_of("Balances:\n- £600\n- £50", "Is a balance above £500?")
 
 

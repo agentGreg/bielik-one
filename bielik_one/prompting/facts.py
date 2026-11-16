@@ -157,8 +157,10 @@ TIME_BEFORE = re.compile(r"^[\s,]*(?:on|am|den|w|på|the|,|\s)*(?:[A-Za-zÀ-ž]+
 TIME_AFTER = re.compile(r"^[\s,]*(?:r\.)?[\s,]*(?:o|at|um|kl\.?|klokka|klokken|godz\.|ok\.|około|ca\.|gegen)?"
                         r"\s*(?:godz\.)?\s*$")
 TODAY = re.compile(r"\b(?:(?i:dziś|dzisiaj|today|heute|i dag|dagens dato)|Stand)\b")
-# A sentence can start with a date ("... 2026. 1 May 2026 is a day off."); the dot of a day ("1. Mai") ends none.
-SENT_END = re.compile(r"(?<!\b\d)(?<!\b\d\d)[.;!?](?=\s+[A-ZĄĆĘŁŃÓŚŹŻÄÖÜÆØÅ\d\"'(\[-])|\n")
+# A sentence can start with a date ("... 2026. 1 May 2026 is a day off."); the dot of a day before a month ("1. Mai")
+# ends none, a dot after other numbers ("at 12:00.") does.
+SENT_END = re.compile(r"(?!(?<=\b\d)\.\s+(?i:" + _MONTH_RX + r")\b)(?!(?<=\b\d\d)\.\s+(?i:" + _MONTH_RX + r")\b)"
+                      r"[.;!?](?=\s+[A-ZĄĆĘŁŃÓŚŹŻÄÖÜÆØÅ\d\"'(\[-])|\n")
 
 PRESENT = r"(?:obecnie|nadal|dziś|present|now|today|current|heute|jetzt|aktuell|dato|nå|i dag)"
 MONTH_RANGE = re.compile(r"(?<![\d./\-])(0?[1-9]|1[0-2])[./](\d{4})\s{0,3}(?:-|–|—|to|bis|til|do)\s{0,3}"
@@ -532,7 +534,10 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
     def free(a, b):
         return not overlaps(masked, mstarts, a, b)
 
-    ends = set()  # where the amounts end: a dash right after one is a range ("£100 - £200"), not a minus sign
+    prefixed = list(islice(AMOUNT_PREFIX.finditer(text), MAX_MATCHES))
+    suffixed = list(islice(AMOUNT_SUFFIX.finditer(text), MAX_MATCHES))
+    # where the amounts of both forms end: a dash right after one is a range ("100 GBP - £200"), not a minus sign
+    ends = {m.end() for m in prefixed + suffixed}
 
     def negative(start):
         """A minus sign before the amount, separated by spaces ("- £600", "- 600 zł"); the regexes reject "-£600".
@@ -549,8 +554,7 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
             return False  # a list bullet
         return k not in ends
 
-    for m in islice(AMOUNT_PREFIX.finditer(text), MAX_MATCHES):
-        ends.add(m.end())
+    for m in prefixed:
         if not free(m.start(), m.end()) or negative(m.start()):
             continue
         v = _number(m.group(2), lang, money=True)
@@ -559,8 +563,7 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
             out.append(_Amount(m.start(), m.end(), v, _CUR_PREFIX[sym.lower()], _places(m.group(2), lang), True, sym))
     taken = sorted((a.start, a.end) for a in out)
     tstarts = [x for x, _ in taken]
-    for m in islice(AMOUNT_SUFFIX.finditer(text), MAX_MATCHES):
-        ends.add(m.end())
+    for m in suffixed:
         if not free(m.start(), m.end()) or overlaps(taken, tstarts, m.start(), m.end()) or negative(m.start()):
             continue
         unit = next(u for g, u in _SUFFIX_GROUPS if m.group(g))
