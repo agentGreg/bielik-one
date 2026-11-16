@@ -44,6 +44,8 @@ from bielik_one import launch
 # What vLLM reports for a -inf processed logprob; the frontend treats <= -9990 as "not a head".
 CLAMP = -9999.0
 MAX_MODEL_LEN = 32768
+# The request is untrusted and the stop strings are checked after every token: their number and length are bounded.
+MAX_STOPS, MAX_STOP_CHARS = 16, 1000
 BASE_HEAD_FLAG, BASE_HEAD_VALUE = "systemone_head", "base"
 # Base repository files the backend reads: mlx_lm loads model*.safetensors, the config (and hf_quant_config.json
 # when the config has no quantization) and the tokenizer; transformers also reads additional_chat_templates/*.jinja.
@@ -269,6 +271,8 @@ def sampling(body: dict, defaults: dict, prompt_tokens: int, vocab_size: int) ->
         stop = [stop]
     if not isinstance(stop, list) or not all(isinstance(s, str) for s in stop):
         raise ValueError("stop must be a string or a list of strings")
+    if len(stop) > MAX_STOPS or any(len(s) > MAX_STOP_CHARS for s in stop):
+        raise ValueError(f"stop takes at most {MAX_STOPS} strings of at most {MAX_STOP_CHARS} characters")
     if (body.get("n") or 1) != 1:
         raise ValueError("n > 1 is not supported")
     return {
@@ -298,9 +302,11 @@ def stop_at(steps, stops: list[str]):
     None) steps, cut before the first stop string. Text that may be the start of a stop string is held back until
     it is not, so a stream sends only text the whole response contains; at the end it is sent (no stop matched)."""
     text, tokens = "", 0
+    longest = max(map(len, stops), default=0)
     for piece, tokens, finish in steps:
+        start = max(len(text) - longest + 1, 0)  # a stop string not found so far ends in the new piece
         text += piece
-        hits = [i for i in (text.find(s) for s in stops) if i >= 0]
+        hits = [i for i in (text.find(s, start) for s in stops) if i >= 0]
         if hits:
             yield text[: min(hits)], tokens, "stop", True
             return

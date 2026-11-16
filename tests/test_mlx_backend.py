@@ -231,6 +231,13 @@ class SamplingTests(unittest.TestCase):
         for top_k in (0, -1, 1000, 10**9):  # off; mlx_lm refuses a top_k that keeps the whole vocabulary
             self.assertEqual(mlx_backend.sampling({"top_k": top_k}, {}, 10, 1000)["top_k"], 0)
 
+    def test_stop_strings_are_bounded(self):
+        """Stop strings are checked after every token of an untrusted request."""
+        for stop in (["x"] * 17, ["x" * 1001]):
+            with self.assertRaises(ValueError):
+                mlx_backend.sampling({"stop": stop}, {}, 10, 1000)
+        self.assertEqual(len(mlx_backend.sampling({"stop": ["x" * 1000] * 16}, {}, 10, 1000)["stop"]), 16)
+
 
 class StopTests(unittest.TestCase):
     def run_steps(self, pieces, stops, finish="stop"):
@@ -248,6 +255,10 @@ class StopTests(unittest.TestCase):
         self.assertEqual(out[-1][2:], ("stop", True))
         out = self.run_steps(["ab", "c</"], ["</end>"], finish="length")
         self.assertEqual(out[-1], ("abc</", 2, "length", True))  # an unfinished stop string is not a match
+
+    def test_a_stop_string_split_over_many_pieces_is_found(self):
+        out = self.run_steps(list("abc hello world xyz"), ["hello world", "o w"])
+        self.assertEqual(out[-1][:3], ("abc hell", 11, "stop"))  # "o w" is complete at the 11th piece
 
     def test_earliest_stop_string_wins(self):
         out = self.run_steps(["hello world"], ["world", "lo"])
