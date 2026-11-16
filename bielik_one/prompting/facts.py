@@ -157,7 +157,8 @@ TIME_BEFORE = re.compile(r"^[\s,]*(?:on|am|den|w|på|the|,|\s)*(?:[A-Za-zÀ-ž]+
 TIME_AFTER = re.compile(r"^[\s,]*(?:r\.)?[\s,]*(?:o|at|um|kl\.?|klokka|klokken|godz\.|ok\.|około|ca\.|gegen)?"
                         r"\s*(?:godz\.)?\s*$")
 TODAY = re.compile(r"\b(?:(?i:dziś|dzisiaj|today|heute|i dag|dagens dato)|Stand)\b")
-SENT_END = re.compile(r"[.;!?](?=\s+[A-ZĄĆĘŁŃÓŚŹŻÄÖÜÆØÅ\"'(\[-])|\n")
+# A sentence can start with a date ("... 2026. 1 May 2026 is a day off."); the dot of a day ("1. Mai") ends none.
+SENT_END = re.compile(r"(?<!\b\d)(?<!\b\d\d)[.;!?](?=\s+[A-ZĄĆĘŁŃÓŚŹŻÄÖÜÆØÅ\d\"'(\[-])|\n")
 
 PRESENT = r"(?:obecnie|nadal|dziś|present|now|today|current|heute|jetzt|aktuell|dato|nå|i dag)"
 MONTH_RANGE = re.compile(r"(?<![\d./\-])(0?[1-9]|1[0-2])[./](\d{4})\s{0,3}(?:-|–|—|to|bis|til|do)\s{0,3}"
@@ -165,8 +166,8 @@ MONTH_RANGE = re.compile(r"(?<![\d./\-])(0?[1-9]|1[0-2])[./](\d{4})\s{0,3}(?:-|�
 
 WORKDAY_WORDS = re.compile(r"\b(?:dni robocz|dnia robocz|dzień robocz|working day|business day|werktag|arbeitstag|"
                            r"virkedag|arbeidsdag|yrkedag)", re.I)
-HOLIDAY_WORDS = re.compile(r"\b(?:wolny|wolnym|wolne|wolnymi|świę|święt|holiday|feiertag|arbeitsfrei|helligdag|fridag|"
-                           r"høytidsdag|offentlig fri)", re.I)
+HOLIDAY_WORDS = re.compile(r"\b(?:wolny|wolnym|wolne|wolnymi|świę|święt|holiday|days? off\b|non-working day|feiertag|"
+                           r"arbeitsfrei|freie[rn]? tag|helligdag|fridag|høytidsdag|offentlig fri)", re.I)
 _DUR_UNITS = [
     ("wd", r"dni robocz\w*|dnia robocz\w*|dzień robocz\w*|working days?|business days?|werktag\w*|arbeitstag\w*|"
            r"virkedag\w*|arbeidsdag\w*|yrkedag\w*"),
@@ -178,8 +179,8 @@ _DUR_UNITS = [
 DURATION = re.compile(r"(?<![\w,.])(\d{1,4})\s?(?:-\s?)?(?:(?:calendar|full|clear|kalendarzow\w*|"
                       r"pełn\w*|volle[n]?|hele)\s+)?(" + "|".join(f"(?P<{u}>{rx})" for u, rx in _DUR_UNITS) + r")\b",
                       re.I)
-ORDINAL_DAY = re.compile(r"(?<![\w,.])(\d{1,3})\.\s?(?:dnia|dzień|tag|tages|dag|werktag\w*|arbeitstag\w*|virkedag\w*)\b"
-                         r"(\s+robocz\w*)?", re.I)
+ORDINAL_DAY = re.compile(r"(?<![\w,.])(\d{1,3})(?:\.\s?(?:dnia|dzień|tag|tages|dag|werktag\w*|arbeitstag\w*|virkedag\w*)|"
+                         r"(?:st|nd|rd|th)\s(?:(?:working|business|calendar)\s)?day)\b(\s+robocz\w*)?", re.I)
 PAST = re.compile(r"^\s*(?:temu|ago|siden|zuvor|her)\b", re.I)
 
 # numbers with a unit: currencies and common measurement units
@@ -531,8 +532,26 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
     def free(a, b):
         return not overlaps(masked, mstarts, a, b)
 
+    ends = set()  # where the amounts end: a dash right after one is a range ("£100 - £200"), not a minus sign
+
+    def negative(start):
+        """A minus sign before the amount, separated by spaces ("- £600", "- 600 zł"); the regexes reject "-£600".
+        Not a list bullet ("- £600" at a line start) and not the dash of a range."""
+        i = start
+        while i and text[i - 1] in " \t  ":
+            i -= 1
+        if i == start or not i or text[i - 1] not in "-−":
+            return False
+        k = i - 1
+        while k and text[k - 1] in " \t  ":
+            k -= 1
+        if text[i - 1] == "-" and (not k or text[k - 1] == "\n"):
+            return False  # a list bullet
+        return k not in ends
+
     for m in islice(AMOUNT_PREFIX.finditer(text), MAX_MATCHES):
-        if not free(m.start(), m.end()):
+        ends.add(m.end())
+        if not free(m.start(), m.end()) or negative(m.start()):
             continue
         v = _number(m.group(2), lang, money=True)
         if v is not None:
@@ -541,7 +560,8 @@ def find_amounts(text: str, lang: str, masked: Sequence[tuple[int, int]] = ()) -
     taken = sorted((a.start, a.end) for a in out)
     tstarts = [x for x, _ in taken]
     for m in islice(AMOUNT_SUFFIX.finditer(text), MAX_MATCHES):
-        if not free(m.start(), m.end()) or overlaps(taken, tstarts, m.start(), m.end()):
+        ends.add(m.end())
+        if not free(m.start(), m.end()) or overlaps(taken, tstarts, m.start(), m.end()) or negative(m.start()):
             continue
         unit = next(u for g, u in _SUFFIX_GROUPS if m.group(g))
         sym = next(m.group(g) for g, u in _SUFFIX_GROUPS if m.group(g))
@@ -585,6 +605,7 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     """The facts for a state and the instructions of its questions, as (lines, language). Empty lines when there is
     nothing to compute. Dates and amounts come from the state; durations, thresholds and named days off also from the
     instructions."""
+    whole = len(state) <= MAX_INPUT_CHARS  # only then can an identifier be said to be absent
     state = state[:MAX_INPUT_CHARS]
     rule = "\n".join(instructions)[:MAX_INPUT_CHARS]
     lang = language or detect_language(state + "\n" + rule)
@@ -701,8 +722,8 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
     amounts = find_amounts(state, lang, masked)
     thresholds = find_amounts(rule, lang, [(x.start, x.end) for x in find_dates(rule)])
     sums = _sums(state, amounts, lang, sentences=bool(SUM_WORDS.search(rule)))
-    lines += [s for s, _, _ in sums][:MAX_SUMS]
-    computed = [(v, like, max(like.places, 0)) for _, v, like in sums[:MAX_SUMS]]
+    lines += [s for s, *_ in sums][:MAX_SUMS]
+    computed = [(v, like, places) for _, v, like, places in sums[:MAX_SUMS]]
     if PER_PERSON.search(rule) or PER_PERSON.search(state):
         persons = {int(m.group(1)) for m in PERSONS.finditer(state)}
         if len(persons) == 1:
@@ -723,7 +744,10 @@ def facts(state: str, instructions: Sequence[str] = (), language: str | None = N
             continue
         m = ID_PATTERNS[kind].search(state)
         what = t["what"][kind]
-        ids.append(t["found"].format(what=what, value=m.group(0).strip()) if m else t["missing"].format(what=what))
+        if m:
+            ids.append(t["found"].format(what=what, value=m.group(0).strip()))
+        elif whole:
+            ids.append(t["missing"].format(what=what))
     lines += ids[:MAX_IDS]
     return lines, lang
 
@@ -737,9 +761,10 @@ def _span(lo: date, hi: date, t: dict) -> str:
     return t["span"].format(y=m // 12, m=m % 12)
 
 
-def _sums(state: str, amounts: list[_Amount], lang: str, sentences: bool = True) -> list[tuple[str, Decimal, _Amount]]:
+def _sums(state: str, amounts: list[_Amount], lang: str,
+          sentences: bool = True) -> list[tuple[str, Decimal, _Amount, int]]:
     """Sums of same-unit amounts: of one sentence, of the lines of a list, and of list lines that share a
-    description (sentences only when `sentences`). Returns (line, value, a representative amount)."""
+    description (sentences only when `sentences`). Returns (line, value, a representative amount, decimal places)."""
     out, done = [], set()
 
     def add(group):
@@ -753,7 +778,7 @@ def _sums(state: str, amounts: list[_Amount], lang: str, sentences: bool = True)
         places = max(a.places for a in group)
         total = sum((a.value for a in group), Decimal(0))
         out.append((" + ".join(_render_amount(a.value, a, lang, places) for a in group) + " = "
-                    + _render_amount(total, group[0], lang, places), total, group[0]))
+                    + _render_amount(total, group[0], lang, places), total, group[0], places))
 
     # list lines
     lines, pos = [], 0
@@ -825,9 +850,18 @@ def _comparisons(amounts, computed, thresholds, lang) -> list[str]:
         v, a, places = subjects[i]
         x = th[j]
         op = ">" if v > x.value else "<" if v < x.value else "="
-        out.append(f"{_render_amount(v, a, lang, max(places, x.places if v != v.to_integral_value() else 0))} {op} "
-                   f"{_render_amount(x.value, x, lang)}")
+        places = max(places, x.places if v != v.to_integral_value() else 0)
+        # A rounded value must stay on its side of the threshold: £1.25 is not "£1 > £1", £10 ÷ 3 is "£3.333 > £3.33".
+        while v != x.value and places < 6 and _round(v, places).compare(x.value) != v.compare(x.value):
+            places += 1
+        if _round(v, places).compare(x.value) != v.compare(x.value):
+            continue  # still looks equal at 6 places: no comparison rather than "£3.33 > £3.33"
+        out.append(f"{_render_amount(v, a, lang, places)} {op} {_render_amount(x.value, x, lang)}")
     return out
+
+
+def _round(x: Decimal, places: int) -> Decimal:
+    return x.quantize(Decimal(1).scaleb(-places), ROUND_HALF_UP)
 
 
 def inject(state: str, lines: Sequence[str], language: str) -> str:

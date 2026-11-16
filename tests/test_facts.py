@@ -497,3 +497,46 @@ def test_english_text_quoting_a_polish_amount():
     assert lines == ["1,234.56 zł > 1,000 zł"]  # read as 1234.56 although the text is English
     # "12.500 zł" in English text could be 12.5 or 12500: no comparison rather than a wrong one
     assert not any("12" in x for x in lines_of("The fine was 12.500 zł.", "Is the fine above 1 000 zł?"))
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+@pytest.mark.parametrize(
+    "state, rule",
+    [
+        ("Delivered on 30 April 2026.", "Respond within 1 working day. 1 May 2026 is a day off."),
+        ("Delivered on 30 April 2026. 1 May 2026 is a day off.", "Respond within 1 working day."),
+        ("Zugestellt am 30. April 2026. Der 1. Mai 2026 ist ein freier Tag.", "Antwort binnen 1 Werktag."),
+    ],
+)
+def test_english_and_german_days_off_and_a_sentence_starting_with_a_date(state, rule):
+    lines = lines_of(state, rule)
+    assert any(x.startswith("2026-04-30 + 1 ") and "= 2026-05-04" in x for x in lines), lines
+    assert lines[0].startswith("2026-04-30 = ")  # the delivery date is not taken for a day off
+
+
+def test_english_ordinal_day_of_a_deadline():
+    lines = lines_of("Delivered on 1 September 2026.", "Respond by the 14th day after delivery.")
+    assert "2026-09-01 + 14 days = 2026-09-15 (Tuesday)" in lines
+
+
+def test_a_minus_sign_separated_by_a_space_is_still_negative():
+    assert lines_of("The balance is - £600.", "Is the balance above £500?") == []
+    assert lines_of("Saldo wynosi - 600 zł, opłata − 700 zł.", "Czy saldo przekracza 500 zł?") == []
+    # a range and a list bullet are not a minus sign
+    assert lines_of("Price range £100 - £200.", "Is it above £150?") == ["£100 < £150", "£200 > £150"]
+    assert "£600 > £500" in lines_of("Balances:\n- £600\n- £50", "Is a balance above £500?")
+
+
+def test_a_rounded_amount_stays_on_its_side_of_the_threshold():
+    assert "£1.25 > £1" in lines_of("Items:\n- £1\n- £0.25", "Is the total above £1?")
+    lines = lines_of("The bill was £10 for 3 persons.", "Is the amount per person above £3.33?")
+    assert "£3.333 > £3.33" in lines and "£3.33 > £3.33" not in lines
+
+
+def test_no_identifier_is_said_to_be_missing_from_a_state_read_only_in_part():
+    rule = "Does the text contain an e-mail address?"
+    assert lines_of("x " * 10_001 + "contact a@b.com", rule) == []
+    assert lines_of("x " * 100 + "no contact", rule) == ["The text contains no e-mail address"]
+    assert lines_of("contact a@b.com " + "x " * 10_001, rule) == ["The text contains e-mail address: a@b.com"]
