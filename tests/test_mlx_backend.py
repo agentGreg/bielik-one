@@ -44,16 +44,9 @@ class FakeRunner:
 
     def generate(self, prompt_ids, params):
         self.calls.append(("generate", params))
-        text = ""
         words = ["hello", " world"]
-        for n, word in enumerate(words, 1):
-            text += word
-            hit = next((s for s in params["stop"] if s in text), None)
-            if hit:
-                yield text[: text.index(hit)], n, "stop", True
-                return
-            done = n == len(words)
-            yield text, n, "stop" if done else "length", done
+        steps = ((word, n, "stop" if n == len(words) else None) for n, word in enumerate(words, 1))
+        yield from mlx_backend.stop_at(steps, params["stop"])
 
 
 def client(base_row_heads=False):
@@ -166,6 +159,30 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(out["choices"][0]["finish_reason"], "stop")
         self.assertEqual(out["usage"]["prompt_tokens"], 2)
 
+    def test_streaming_holds_back_a_possible_stop_string(self):
+        """A stream never sends text the stop string later cuts off: it ends as the non-streamed answer does."""
+        c, _ = client()
+        cases = [("hello world", ""), ("lo w", "hel"), ("lo wx", "hello world"), ("d!", "hello world"),
+                 (["x", "o w"], "hell")]
+        for stop, text in cases:
+            body = {"prompt": "ab", "stop": stop}
+            full = c.post("/v1/completions", json=body).json()["choices"][0]
+            with c.stream("POST", "/v1/completions", json={**body, "stream": True}) as r:
+                events = [line[6:] for line in r.iter_lines() if line.startswith("data: ")]
+            chunks = [json.loads(e)["choices"][0] for e in events[:-1]]
+            self.assertEqual(full["text"], text, stop)
+            self.assertEqual("".join(ch["text"] for ch in chunks), text, stop)
+            self.assertEqual(chunks[-1]["finish_reason"], full["finish_reason"], stop)
+
+    def test_out_of_range_sampling_is_refused_before_the_stream_starts(self):
+        c, runner = client()
+        for extra in ({"min_p": 2}, {"temperature": -1}, {"top_p": 0}, {"top_k": -2}, {"seed": "1"}):
+            body = {"messages": [{"role": "user", "content": "hi"}], "stream": True, **extra}
+            r = c.post("/v1/chat/completions", json=body)
+            self.assertEqual(r.status_code, 400, extra)
+            self.assertEqual(r.json()["error"]["type"], "BadRequestError")
+        self.assertEqual([k for k, _ in runner.calls if k == "generate"], [])
+
     def test_official_frontend_reads_through_the_backend(self):
         """RemoteVllmEngine's read (anchor, canary, clamping checks) accepts the backend's answers."""
         c, _ = client(base_row_heads=True)
@@ -189,16 +206,52 @@ class ProtocolTests(unittest.TestCase):
 
 class SamplingTests(unittest.TestCase):
     def test_request_values_then_generation_config_then_vllm_defaults(self):
-        s = mlx_backend.sampling({"top_k": -1, "top_p": 1}, {"temperature": 0.6, "top_p": 0.95}, 10)
+        s = mlx_backend.sampling({"top_k": -1, "top_p": 1}, {"temperature": 0.6, "top_p": 0.95}, 10, 1000)
         self.assertEqual((s["temperature"], s["top_p"], s["top_k"], s["min_p"]), (0.6, 0.0, 0, 0.0))
         self.assertEqual(s["max_tokens"], mlx_backend.MAX_MODEL_LEN - 10)
-        s = mlx_backend.sampling({"temperature": 0, "max_completion_tokens": 4, "stop": "x"}, {}, 10)
+        s = mlx_backend.sampling({"temperature": 0, "max_completion_tokens": 4, "stop": "x"}, {}, 10, 1000)
         self.assertEqual((s["temperature"], s["max_tokens"], s["stop"]), (0.0, 4, ["x"]))
 
     def test_invalid(self):
         for body in ({"max_tokens": 0}, {"max_tokens": mlx_backend.MAX_MODEL_LEN}, {"stop": [1]}, {"n": 2}):
             with self.assertRaises(ValueError):
-                mlx_backend.sampling(body, {}, 10)
+                mlx_backend.sampling(body, {}, 10, 1000)
+
+    def test_ranges_as_vllm_checks_them(self):
+        """mlx_lm raises on these only when the first token is sampled, after a stream has started."""
+        for body in ({"temperature": -0.1}, {"temperature": math.nan}, {"temperature": math.inf}, {"top_p": 0},
+                     {"top_p": 1.5}, {"top_p": math.nan}, {"top_k": -2}, {"min_p": 2}, {"min_p": -0.1},
+                     {"min_p": math.nan}, {"seed": "1"}, {"seed": True}, {"seed": 2**63}, {"seed": 0.5}):
+            with self.assertRaises(ValueError, msg=body):
+                mlx_backend.sampling(body, {}, 10, 1000)
+        with self.assertRaises(ValueError):  # a generation_config default is checked like a request value
+            mlx_backend.sampling({}, {"min_p": 2.0}, 10, 1000)
+        s = mlx_backend.sampling({"temperature": 1, "min_p": 1, "top_k": 999, "seed": -1}, {}, 10, 1000)
+        self.assertEqual((s["min_p"], s["top_k"], s["seed"]), (1.0, 999, 2**64 - 1))
+        for top_k in (0, -1, 1000, 10**9):  # off; mlx_lm refuses a top_k that keeps the whole vocabulary
+            self.assertEqual(mlx_backend.sampling({"top_k": top_k}, {}, 10, 1000)["top_k"], 0)
+
+
+class StopTests(unittest.TestCase):
+    def run_steps(self, pieces, stops, finish="stop"):
+        steps = [(p, n, finish if n == len(pieces) else None) for n, p in enumerate(pieces, 1)]
+        return list(mlx_backend.stop_at(steps, stops))
+
+    def test_text_that_may_start_a_stop_string_is_held_back(self):
+        out = self.run_steps(["ab", "c<", "/e", "nd>x"], ["</end>"])
+        self.assertEqual([t for t, *_ in out], ["ab", "abc", "abc", "abc"])
+        self.assertEqual(out[-1][1:], (4, "stop", True))
+
+    def test_held_text_is_released_on_mismatch_or_at_the_end(self):
+        out = self.run_steps(["ab", "c<", "/x"], ["</end>"])
+        self.assertEqual([t for t, *_ in out], ["ab", "abc", "abc</x"])
+        self.assertEqual(out[-1][2:], ("stop", True))
+        out = self.run_steps(["ab", "c</"], ["</end>"], finish="length")
+        self.assertEqual(out[-1], ("abc</", 2, "length", True))  # an unfinished stop string is not a match
+
+    def test_earliest_stop_string_wins(self):
+        out = self.run_steps(["hello world"], ["world", "lo"])
+        self.assertEqual(out, [("hel", 1, "stop", True)])
 
 
 QWEN_KEY = "base_model.model.model.language_model.layers.{}.{}.lora_{}.weight"
@@ -291,6 +344,29 @@ class BaseCheckTests(unittest.TestCase):
     def test_pinned_files_only(self):
         self.assertEqual(set(self.expected), {"model-00001-of-00001.safetensors", "config.json"})
         mlx_backend.verify_base(self.base, self.expected)
+
+    def test_extra_tokenizer_and_config_files_are_refused(self):
+        """Files the loaders would read that the pinned revision does not have, e.g. a chat_template.jinja that
+        transformers prefers to tokenizer_config.json's template."""
+        for name in ("chat_template.jinja", "tokenizer_config.json", "hf_quant_config.json",
+                     "additional_chat_templates/default.jinja"):
+            path = self.base / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("{}")
+            with self.assertRaisesRegex(ValueError, f"{name} not part of the pinned revision"):
+                mlx_backend.verify_base(self.base, self.expected)
+            path.unlink()
+        for name in ("README.md", ".gitattributes", "notes/chat_template.jinja"):  # not read by the loaders
+            path = self.base / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("x")
+        mlx_backend.verify_base(self.base, self.expected)
+
+    def test_pinned_template_directory_is_checked(self):
+        siblings = [SimpleNamespace(rfilename=name, lfs=None, blob_id="0") for name in (
+            "model.safetensors", "chat_template.jinja", "additional_chat_templates/tool_use.jinja", "sub/x.jinja")]
+        self.assertEqual(set(mlx_backend.checksums_from_siblings(siblings)),
+                         {"model.safetensors", "chat_template.jinja", "additional_chat_templates/tool_use.jinja"})
 
     def test_changed_missing_or_extra_weights_are_refused(self):
         (self.base / "config.json").write_text('{"x": 1}')
@@ -393,6 +469,37 @@ def test_switched_lora_matches_peft_formula(mlx_model, tmp_path):
             mlx_model.Switch.on = False
     np.testing.assert_allclose(off, x @ w.T, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(on, x @ w.T + 2.0 * (x @ a.T) @ b.T, rtol=1e-5, atol=1e-5)
+
+
+def test_seeded_sampling_does_not_depend_on_the_thread(mlx_model):
+    """A seeded request draws from its own key: stepping it on other threads (whose MLX random state differs, as
+    Starlette's worker threads do) gives the same tokens, and the global random state is left alone."""
+    import mlx.core as mx
+
+    params = {"temperature": 1.0, "top_p": 0.9, "min_p": 0.0, "top_k": 0, "seed": 3, "max_tokens": 19}
+    with mx.stream(mx.cpu):
+        logprobs = mx.log(mx.softmax(mx.random.normal((1, 64), key=mx.random.key(0)), axis=-1))
+        mx.eval(logprobs)
+        sampler = mlx_model.request_sampler(params)
+        same_thread = [sampler(logprobs).item() for _ in range(20)]
+    sampler, threads = mlx_model.request_sampler(params), []
+
+    def step(seed):
+        mx.random.seed(seed)
+        with mx.stream(mx.cpu):
+            threads.append(sampler(logprobs).item())
+
+    for n in range(20):
+        worker = threading.Thread(target=step, args=(n,))
+        worker.start()
+        worker.join()
+    assert threads == same_thread
+    assert len(set(same_thread)) > 1  # sampled, not greedy
+    mx.random.seed(11)
+    before = mx.random.uniform().item()
+    mx.random.seed(11)
+    mlx_model.request_sampler(params)(logprobs)
+    assert mx.random.uniform().item() == before
 
 
 def test_heads_readout_is_log_softmax_over_heads(mlx_model, tmp_path):

@@ -11,9 +11,9 @@ import mlx.nn as nn
 from mlx.utils import tree_unflatten
 from mlx_lm import load
 from mlx_lm.generate import stream_generate
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, make_sampler
 
-from bielik_one.mlx_backend import head_logprobs, lora_pairs, lora_scale, module_index
+from bielik_one.mlx_backend import head_logprobs, lora_pairs, lora_scale, module_index, stop_at
 
 
 class Switch:
@@ -63,6 +63,37 @@ def attach_lora(model: nn.Module, adapter_dir: Path, rank: int | None, dtype=mx.
     del weights
     model.update_modules(tree_unflatten(replacements))
     return len(replacements), nbytes
+
+
+def request_sampler(params: dict):
+    """mlx_lm's sampler for the request's parameters. With a seed, the filters of make_sampler (same order) and a
+    categorical draw with the request's own key for each token: MLX's global random state is per thread, and a
+    streamed generation is stepped on whichever worker thread Starlette picks."""
+    temp, top_p, min_p, top_k = params["temperature"], params["top_p"], params["min_p"], params["top_k"]
+    if params["seed"] is None or temp == 0:
+        return make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+    filters = []
+    if 0 < top_p < 1.0:
+        filters.append(lambda x: apply_top_p(x, top_p))
+    if min_p != 0.0:
+        filters.append(lambda x: apply_min_p(x, min_p, 1))
+    if top_k > 0:
+        filters.append(lambda x: apply_top_k(x, top_k))
+    # One key per draw, evaluated now: a lazy key would be computed on the stream of the thread that made it.
+    # generate_step samples max_tokens + 1 times (the last token is computed ahead and dropped).
+    with mx.stream(mx.cpu):
+        keys = mx.random.split(mx.random.key(params["seed"]), params["max_tokens"] + 1)
+        mx.eval(keys)
+    drawn = 0
+
+    def sampler(logprobs):
+        nonlocal drawn
+        for f in filters:
+            logprobs = f(logprobs)
+        key, drawn = keys[min(drawn, len(keys) - 1)], drawn + 1
+        return mx.random.categorical(logprobs * (1.0 / temp), key=key)
+
+    return sampler
 
 
 class Heads:
@@ -143,27 +174,20 @@ class MlxRunner:
     def generate(self, prompt_ids: list[int], params: dict):
         """Base-model generation (LoRA off). The lock is taken per token, so decision reads interleave with a
         running generation; each step builds its graph with the adapter off, and its KV cache is its own."""
-        if params["seed"] is not None:
-            mx.random.seed(int(params["seed"]))
-        sampler = make_sampler(
-            temp=params["temperature"], top_p=params["top_p"], min_p=params["min_p"], top_k=params["top_k"]
-        )
-        stops = params["stop"]
+        sampler = request_sampler(params)
         steps = stream_generate(self.model, self.tok, prompt_ids, max_tokens=params["max_tokens"], sampler=sampler)
-        text = ""
-        try:
+
+        def pieces():
             while True:
                 with self.lock:
                     Switch.on = False
                     step = next(steps, None)
                 if step is None:
                     return
-                text += step.text
-                hit = next((s for s in stops if s in text), None)
-                if hit:
-                    yield text[: text.index(hit)], step.generation_tokens, "stop", True
-                    return
-                yield text, step.generation_tokens, step.finish_reason or "length", step.finish_reason is not None
+                yield step.text, step.generation_tokens, step.finish_reason
+
+        try:
+            yield from stop_at(pieces(), params["stop"])
         finally:
             with self.lock:
                 steps.close()

@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import time
 import uuid
@@ -44,13 +45,16 @@ from bielik_one import launch
 CLAMP = -9999.0
 MAX_MODEL_LEN = 32768
 BASE_HEAD_FLAG, BASE_HEAD_VALUE = "systemone_head", "base"
-# Base repository files the backend reads: mlx_lm loads model*.safetensors, the config and the tokenizer.
+# Base repository files the backend reads: mlx_lm loads model*.safetensors, the config (and hf_quant_config.json
+# when the config has no quantization) and the tokenizer; transformers also reads additional_chat_templates/*.jinja.
 BASE_FILES = [
     "config.json",
     "generation_config.json",
+    "hf_quant_config.json",
     "model*.safetensors",
     "model*.safetensors.index.json",
     *launch.TOKENIZER_FILES,
+    "additional_chat_templates/*.jinja",
 ]
 
 
@@ -105,7 +109,7 @@ def sha256(path: Path) -> str:
 
 
 def wanted(name: str) -> bool:
-    return "/" not in name and any(fnmatch(name, pattern) for pattern in BASE_FILES)
+    return any(fnmatch(name, pattern) and name.count("/") == pattern.count("/") for pattern in BASE_FILES)
 
 
 def hub_checksums(repo: str, revision: str) -> dict[str, tuple[str, str]]:
@@ -139,9 +143,12 @@ def verify_base(base: Path, expected: dict[str, tuple[str, str]]) -> None:
         actual = sha256(path) if algorithm == "sha256" else git_blob_sha1(path)
         if actual != digest:
             raise ValueError(f"base model: {name} differs from the pinned revision")
-    # mlx_lm loads every model*.safetensors in the directory: an extra one would change the weights.
+    # The loaders read whatever of these files the directory holds: an extra model*.safetensors would change the
+    # weights, an extra chat_template.jinja (preferred to tokenizer_config.json's template) the chat prompt.
+    present = [*base.iterdir(), *(base / "additional_chat_templates").glob("*")]
     extra = sorted(
-        p.name for p in base.glob("model*.safetensors") if p.name not in expected
+        name for name in (p.relative_to(base).as_posix() for p in present if p.is_file())
+        if wanted(name) and name not in expected
     )
     if extra:
         raise ValueError(f"base model: {', '.join(extra)} not part of the pinned revision")
@@ -222,16 +229,30 @@ def read_kind(body: dict, alias: str, base_row_heads: bool) -> str:
     return "base_heads" if flagged and base_row_heads else "vocab"
 
 
-def sampling(body: dict, defaults: dict, prompt_tokens: int) -> dict:
+def sampling(body: dict, defaults: dict, prompt_tokens: int, vocab_size: int) -> dict:
     """Generation parameters as vLLM reads them: request values, else the model's generation_config, else vLLM's
-    defaults. Without max_tokens a generation may fill the context."""
+    defaults. Without max_tokens a generation may fill the context. Values vLLM refuses are refused here, before a
+    response starts: mlx_lm would raise only once the first token is sampled."""
 
     def pick(name, fallback):
         value = body.get(name)
         return defaults.get(name, fallback) if value is None else value
 
+    temperature = float(pick("temperature", 1.0))
     top_k = int(pick("top_k", 0))
     top_p = float(pick("top_p", 1.0))
+    min_p = float(pick("min_p", 0.0))
+    if not (math.isfinite(temperature) and temperature >= 0):
+        raise ValueError(f"temperature must be non-negative, got {temperature}")
+    if not 0 < top_p <= 1:
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+    if top_k < -1:
+        raise ValueError(f"top_k must be -1 (disable), or at least 1, got {top_k}")
+    if not 0 <= min_p <= 1:
+        raise ValueError(f"min_p must be in [0, 1], got {min_p}")
+    seed = body.get("seed")
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or not -2**63 <= seed < 2**63):
+        raise ValueError("seed must be a 64-bit integer")
     max_tokens = body.get("max_tokens")
     if max_tokens is None:
         max_tokens = body.get("max_completion_tokens")
@@ -251,14 +272,43 @@ def sampling(body: dict, defaults: dict, prompt_tokens: int) -> dict:
     if (body.get("n") or 1) != 1:
         raise ValueError("n > 1 is not supported")
     return {
-        "temperature": float(pick("temperature", 1.0)),
-        "top_p": top_p if 0 < top_p < 1 else 0.0,
-        "top_k": max(top_k, 0),
-        "min_p": float(pick("min_p", 0.0)),
+        "temperature": temperature,
+        "top_p": top_p if top_p < 1 else 0.0,  # 0: off, for mlx_lm
+        "top_k": top_k if 0 < top_k < vocab_size else 0,  # mlx_lm refuses a top_k that keeps the whole vocabulary
+        "min_p": min_p,
         "max_tokens": max_tokens,
         "stop": [s for s in stop if s],
-        "seed": body.get("seed"),
+        "seed": None if seed is None else seed % 2**64,  # an MLX key takes an unsigned 64-bit seed
     }
+
+
+def stop_prefix(text: str, stops: list[str]) -> int:
+    """Length of the longest end of text that a stop string begins with (and is shorter than it)."""
+    longest = 0
+    for stop in stops:
+        for n in range(min(len(stop) - 1, len(text)), longest, -1):
+            if text.endswith(stop[:n]):
+                longest = n
+                break
+    return longest
+
+
+def stop_at(steps, stops: list[str]):
+    """(text so far, tokens, finish reason, done) of a generation from its (new text, tokens, finish reason or
+    None) steps, cut before the first stop string. Text that may be the start of a stop string is held back until
+    it is not, so a stream sends only text the whole response contains; at the end it is sent (no stop matched)."""
+    text, tokens = "", 0
+    for piece, tokens, finish in steps:
+        text += piece
+        hits = [i for i in (text.find(s) for s in stops) if i >= 0]
+        if hits:
+            yield text[: min(hits)], tokens, "stop", True
+            return
+        if finish is not None:
+            yield text, tokens, finish, True
+            return
+        yield text[: len(text) - stop_prefix(text, stops)], tokens, "length", False
+    yield text, tokens, "length", True
 
 
 def token_prompt(prompt) -> bool:
@@ -340,8 +390,8 @@ def build_app(runner, alias: str, base_row_heads: bool = False):
         if model != alias:
             return error(404, f"The model `{model}` does not exist.")
         try:
-            params = sampling(body, runner.generation_defaults, len(prompt_ids))
-        except (ValueError, TypeError) as exc:
+            params = sampling(body, runner.generation_defaults, len(prompt_ids), runner.vocab_size)
+        except (ValueError, TypeError, OverflowError) as exc:
             return error(400, str(exc))
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
         created = int(time.time())
